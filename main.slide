@@ -1,0 +1,654 @@
+Go API クライアントの実装
+Go Conference 2022 Spring
+23 Apr 2022
+Tags: golang, api, http
+
+Yoshiki Nakagawa
+@yyoshiki41
+
+https://github.com/yyoshiki41
+
+* AboutMe
+
+[[https://github.com/yyoshiki41][@yyoshiki41]]
+
+Yoshiki Nakagawa
+
+- 株式会社LayerX
+
+Gopher
+
+- Go Conference は 2016 年以来
+- 運営チームとコミュニティの方々には, 継続開催への尽力に感謝と尊敬 🙏
+
+* Go API クライアントの実装
+
+1. 認証
+2. APIコールの実装
+3. エラーハンドリング
+4. テスト
+
+* 認証
+
+主なものだと下記
+
+1. 発行された API Key を使用
+2. OAuth 認証で, トークンを取得して使用
+
+
+* 1. API Key
+
+	// Config is a setting for 3rd Party API.
+	type Config struct {
+		Endpoint string
+		APIKey   string
+	}
+
+- Endpoint
+`https://api.example.com`
+
+- APIKey
+`********abcd`
+
+* Client の初期化
+
+	// Client represents an API client for 3rd Party API.
+	type Client struct {
+		config     *Config
+	}
+
+	// NewClient returns a new API client.
+	func NewClient(config *Config) *Client {
+		return &Client{
+			config: config,
+		}
+	}
+
+アプリからの呼び出し
+
+	conf := NewConfig(endpoint, apiKey)
+	client := NewClient(conf)
+	
+	resp, err := client.GetMe(ctx, tokenSource)
+
+* 2. OAuth2
+
+`golang.org/x/oauth2` を使う場合
+
+	type Config struct {
+		Endpoint string
+		OAuth2   *oauth2.Config
+	}
+
+- Endpoint
+`https://api.example.com`
+
+- OAuth2
+`oauth2.Config`
+
+`ClientID`, `ClientSecret`, `RedirectURL` などが初期化に必要.
+
+* Config の初期化
+
+	func NewConfig(apiEndpoint, clientID, clientSecret, redirectURL string) *Config {
+		return &Config{
+			Endpoint: apiEndpoint,
+			OAuth2: &oauth2.Config{
+				ClientID:     clientID,
+				ClientSecret: clientSecret,
+				RedirectURL:  redirectURL,
+				Endpoint: oauth2.Endpoint{
+					AuthURL:   Oauth2AuthURL,
+					TokenURL:  Oauth2TokenURL,
+					AuthStyle: oauth2.AuthStyleInParams,
+				},
+			},
+		}
+	}
+
+* アプリからの呼び出し
+
+	conf := NewConfig(clientID, clientSecret, redirectURL)
+	client := NewClient(conf)
+
+	token := &oauth2.Token{
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		Expiry:       expiredAt,
+	}
+	tokenSource := conf.OAuth2.TokenSource(ctx, token)
+	resp, err := client.GetMe(ctx, tokenSource)
+
+処理の流れ（既に一度OAuth 認証が完了している前提）
+
+1. クレデンシャル情報などをセットし, クライアントライブラリの初期化
+2. Persistent Storage などで保存していた token (アクセストークン, リフレッシュトークン) をセット
+3. API コール
+リフレッシュトークンを用いてのアクセストークン再発行もライブラリ側で行う
+
+* TokenSource
+
+`oauth2.Token` と `err` を返すメソッドを実装するインターフェイス.
+`TokenSource.Token()` 自体は, `http.Client` の Transport 層で呼ばれる.
+
+`RoundTripper` がAPIリクエスト前にトークンが有効かの検証を行う.
+有効期限切れのアクセストークンの場合にはリフレッシュトークンを用いて, `oauth2.Token` の再取得を行う実装になっている.
+
+	type TokenSource interface {
+		// Token returns a token or an error.
+		// Token must be safe for concurrent use by multiple goroutines.
+		// The returned Token must not be modified.
+		Token() (*Token, error)
+	}
+
+`Token()` メソッドは `Transport.RoundTrip()` で呼ばれるため, concurrency-safe になるよう注意が必要.
+
+c.f. [[https://pkg.go.dev/net/http#RoundTripper][net/http#RoundTripper]]
+
+	A RoundTripper must be safe for concurrent use by multiple goroutines.
+
+* RoundTripper
+
+Transport 層でのリクエスト/レスポンスの制御が行えるようにするためのインターフェイス.
+
+c.f. [[https://pkg.go.dev/net/http#RoundTripper][net/http#RoundTripper]]
+
+	RoundTripper is an interface representing the ability to execute a single HTTP transaction, obtaining the Response for a given Request.
+
+- リクエストのリトライの制御
+
+- キャッシュのコントロール
+
+- 詳細なログやメトリクスを取って転送する.
+
+- ユニットテストで外部へのリクエストを行わずに, テスト期待値をレスポンスとして返したい場合
+
+* golang.org/x/oauth2 パッケージの RoundTripper
+
+	// Transport is an http.RoundTripper that makes OAuth 2.0 HTTP requests,
+	// wrapping a base RoundTripper and adding an Authorization header
+	// with a token from the supplied Sources.
+	//
+	// Transport is a low-level mechanism. Most code will use the
+	// higher-level Config.Client method instead.
+	type Transport struct {
+		// Source supplies the token to add to outgoing requests'
+		// Authorization headers.
+		Source TokenSource
+	
+		// Base is the base RoundTripper used to make HTTP requests.
+		// If nil, http.DefaultTransport is used.
+		Base http.RoundTripper
+	}
+	
+	// RoundTrip authorizes and authenticates the request with an
+	// access token from Transport's Source.
+	func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error)
+
+* TokenSource
+
+クライアント側にこの実装が入っていれば, アプリ側で token のリフレッシュなどを気にしなくてよくなります。
+
+golang.org/x/oauth2 の実装以外で対応する場合, 自力での実装が必要になってきます.
+
+* OAuth2 の拡張的な仕様が求められた例
+
+1. Authorization Code Flow で, 独自のHTTPヘッダーが必要
+
+	-H "X-CompanyID: 1234"
+
+2. OAuth Token Endpoint からのレスポンスが独自情報を持っている
+
+`golang.org/x/oauth2` の `Token` ([[https://www.rfc-editor.org/rfc/rfc6749.html][RFC6749]])
+
+	type Token struct {
+		AccessToken  string      `json:"access_token"`
+		TokenType    string      `json:"token_type,omitempty"`
+		RefreshToken string      `json:"refresh_token,omitempty"`
+		Expiry       time.Time   `json:"expiry,omitempty"`
+		raw          interface{}
+	}
+
+拡張されたレスポンス情報は, `raw` というプライベートフィールドで扱えるように用意されている.
+
+	func (t *Token) Extra(key string) interface{}
+	func (t *Token) WithExtra(extra interface{}) *Token
+
+* TokenSource を実装してみる
+
+* oauth2.ReuseTokenSource
+
+token 初期値と 独自の実装をした `TokenSource` インターフェイスを満たす `tokenRefresher` をセットして初期化するヘルパー関数.
+
+この関数に token (リフレッシュトークン) を渡すとリフレッシュトークンが有効である間は, Oauth ダンスを最初から行う必要なく, Token Endpoint からアクセストークンを取得してくれる.
+
+	func (c *Client) TokenSource(ctx context.Context, token *oauth2.Token) oauth2.TokenSource {
+		return oauth2.ReuseTokenSource(
+			token,
+			&tokenRefresher{
+				ctx:          ctx,
+				conf:         c.config,
+				refreshToken: token.RefreshToken,
+			})
+	}
+
+	type tokenRefresher struct {
+		ctx          context.Context
+		conf         *Config
+		refreshToken string
+	}
+
+* tokenRefresher.Token メソッドの実装
+
+`retrieveToken()` で, OAuth Token Endpoint からアクセストークンを再発行する.
+
+	func (tf *tokenRefresher) Token() (*oauth2.Token, error) {
+		if tf.refreshToken == "" {
+			return nil, ErrRefreshTokenIsNotSet
+		}
+		params := url.Values{
+			"client_id":     {tf.conf.Oauth2.ClientID},
+			"client_secret": {tf.conf.Oauth2.ClientSecret},
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {tf.refreshToken},
+		}
+		// IMPLEMENT YOUR CUSTOM retrieveToken FUNCTION
+		tk, err := retrieveToken(tf.ctx, tf.conf, params)
+		if err != nil {
+			return nil, err
+		}
+		if tf.refreshToken != tk.RefreshToken {
+			tf.refreshToken = tk.RefreshToken
+		}
+		return tk, nil
+	}
+
+* tokenRefresher の実装
+
+	func retrieveToken(ctx context.Context, conf *Config, params url.Values) (*TokenResponse, error) {
+		body := strings.NewReader(params.Encode())
+		req, err := http.NewRequest(http.MethodPost, conf.Oauth2.Endpoint.TokenURL, body)
+		if err != nil {
+			return nil, err
+		}
+		// SET YOUR CUSTOM HTTP HEADERS
+		req.Header.Set("X-CompanyID", conf.CompanyID)
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req = req.WithContext(ctx)
+		response, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer response.Body.Close()
+
+		var r io.Reader = response.Body
+		// DECODE YOUR CUSTOM RESPONSE
+		token := &TokenResponse{}
+		if err = json.NewDecoder(r).Decode(token); err != nil {
+			return nil, err
+		}
+		...
+	}
+
+* アプリ側からの呼び出し
+
+	conf := NewConfig(clientID, clientSecret, redirectURL)
+	client := NewClient(conf)
+	token := oauth2.Token{
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		Expiry:       expiredAt,
+	}
+
+	tokenSource := client.TokenSource(ctx, token)
+	resp, err := client.GetMe(ctx, tokenSource)
+	...
+	token, err = tokenSource.Token()
+
+クライアントはアクセストークンが有効でない場合には, refresh_token から新たなアクセストークン取得を行い, API コールの実行を行ってくれる.
+APIコール後に更新されたトークンは, `tokenSource.Token()` で取得可能.
+
+* API リクエストの汎用的な実装
+
+* API リクエストの汎用的な実装
+
+`Client` にユーティリティ関数の `call` メソッドを実装
+
+	func (c *Client) GetMe(
+		ctx context.Context, tokenSource oauth2.TokenSource,
+	) (*User, error) {
+		var resp User
+	
+		err := c.call(ctx, tokenSource, path.Join(pathUser), http.MethodPost, nil, nil, &resp)
+		if err != nil {
+			return nil, err
+		}
+		return &resp, nil
+	}
+
+1. エンドポイントパス, HTTPメソッドと Body パラメータやクエリパラメータがある場合, `call` メソッドへ渡す.
+2. `tokenSource` を `call` メソッドへ渡す.
+アクセストークンが有効期限切れの場合には, Transport 層でリフレッシュトークンでの更新が行われる. アプリ側でも APIコール後に更新されたトークンを保存可能にする.
+3. レスポンスをポインタ型で渡す. (jsonレスポンスをデコードして, 値を入れる)
+
+* API リクエストの汎用的な実装
+
+	func (c *Client) call(
+		ctx context.Context, tokenSource oauth2.TokenSource,
+		path string, method string, queryParams url.Values, postBody interface{}, res interface{},
+	) error {
+		var (
+			contentType string
+			body        io.Reader
+		)
+		if method != http.MethodDelete {
+			contentType = "application/json"
+			jsonParams, err := json.Marshal(postBody)
+			if err != nil {
+				return err
+			}
+			body = bytes.NewBuffer(jsonParams)
+		}
+	
+		req, err := c.newRequest(ctx, path, method, contentType, queryParams, body)
+		if err != nil {
+			return err
+		}
+		return c.do(ctx, tokenSource, req, res)
+	}
+
+* API リクエストの汎用的な実装
+
+	func (c *Client) newRequest(
+		ctx context.Context, apiPath string, method string,
+		contentType string, queryParams url.Values, body io.Reader,
+	) (*http.Request, error) {
+		u, err := url.Parse(c.config.Endpoint)
+		if err != nil {
+			return nil, err
+		}
+		u.Path = path.Join(u.Path, apiPath)
+		u.RawQuery = queryParams.Encode()
+
+		req, err := http.NewRequest(method, u.String(), body)
+		if err != nil {
+			return nil, err
+		}
+		req = req.WithContext(ctx)
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		return req, nil
+	}
+
+* API リクエストの汎用的な実装
+
+	func (c *Client) do(
+		ctx context.Context, tokenSource oauth2.TokenSource,
+		req *http.Request, res interface{},
+	) error {
+		httpClient := oauth2.NewClient(ctx, tokenSource)
+		response, err := httpClient.Do(req)
+		if err != nil {
+			return err
+		}
+		defer response.Body.Close()
+
+		var r io.Reader = response.Body
+		if code := response.StatusCode; code >= http.StatusBadRequest {
+			byt, _ := io.ReadAll(r)
+			return errors.New(byt.String())
+		}
+		if res == nil {
+			return nil
+		}
+		if err := json.NewDecoder(r).Decode(&res); err != nil && err != io.EOF {
+			return err
+		}
+		return nil
+	}
+
+* エラーハンドリング
+
+* エラー型
+
+`client.GetMe` のようなパブリックメソッドが返す `err` の型
+
+HTTP ステータスコードや RawError, 再認証が必要かなどのフィールドを持たせる.
+
+	type Error struct {
+		StatusCode              int
+		RawError                string
+		IsAuthorizationRequired bool
+	}
+	
+	func (e *Error) Error() string {
+		return e.RawError
+	}
+
+* アプリ側でのハンドル
+
+	func IsAuthorizationRequired(err error) bool {
+		if v, ok := err.(*api.Error); ok {
+			return v.IsAuthorizationRequired
+		}
+		return false
+	}
+
+アプリ側でヘルパー関数を用意して, 細かなハンドルが可能.
+エンドユーザーの体験に関わる部分として, API サーバーからのエラーか, refresh_token が revoke されており再度 OAuth認証が必要なエラーかを切り分けるなども出来る.
+
+	me, err := client.GetMe(ctx, tokenSource)
+	if err != nil {
+		if IsAuthorizationRequired(err) {
+			// handle...
+		}
+		return err
+	}
+
+* API エラーのフォーマット
+
+API 側で決まったエラーの型がある場合, RawError を `APIError` に変換する関数を用意.
+
+	type APIError struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Reason  string `json:"reason"`
+	}
+	
+	func (e *Error) MustParseAPIError() *APIError {
+		if e == nil || e.RawError == "" {
+			return nil
+		}
+		aErr := APIError{}
+		if err := json.Unmarshal([]byte(e.RawError), &aErr); err != nil {
+			return nil
+		}
+		return &aErr
+	}
+
+API サーバーが決められた型でエラーを返さないケースを考慮してのもの.
+例えば, API サーバー前段のロードバランサーが "service temporary unavailable" をAPIレスポンスとして返す場合では, `APIError` へのパースは行えない.
+
+* クライアント側でエラーレスポンスを実装する
+
+	response, err := httpClient.Do(req)
+	if err != nil {
+		// handle...
+	}
+
+`http.Client.Do` から返ってくる `err` の処理.
+
+c.f. [[https://pkg.go.dev/net/http#Client.Do][net/http#Client.Do]]
+
+	Any returned error will be of type *url.Error.
+	The url.Error value's Timeout method will report true if the request timed out.
+
+`url.Error` 型で返ってくる `err` を 2段階の処理でハンドルする.
+
+* Transport層でのエラー
+
+最初に `errors.As` で `oauth2.RetrieveError` (Transport 層で起きたOAuthエラー) にアサイン可能かをチェックする.
+（`Unwrap` は `errors.As` 内で実行されている）
+
+認証エラーの場合, IsAuthorizationRequired: true としてレスポンスを返してあげる.
+
+	errOauth2 := &oauth2.RetrieveError{}
+	if errors.As(err, &errOauth2) {
+		resp := &Error{
+			RawError:                err.Error(),
+			StatusCode:              http.StatusUnauthorized,
+			IsAuthorizationRequired: true,
+		}
+		if errOauth2.Response != nil {
+			resp.StatusCode = errOauth2.Response.StatusCode
+		}
+		return resp
+	}
+
+* Transport層でのエラー
+
+次に OAuth 以外のエラーを同じく, `Unwrap` したあと `RawError` として返している.
+（例外系で発生するケース自体もあまり思いつかない.）
+
+	errURL := &url.Error{}
+	if errors.As(err, &errURL) {
+		resp := &Error{
+			RawError: err.Error(),
+		}
+		return resp
+	}
+	return err
+
+* Transport層でのエラー
+
+	response, err := httpClient.Do(req)
+	if err != nil {
+		errOauth2 := &oauth2.RetrieveError{}
+		if errors.As(err, &errOauth2) {
+			resp := &Error{
+				RawError:                err.Error(),
+				StatusCode:              http.StatusUnauthorized,
+				IsAuthorizationRequired: true,
+			}
+			if errOauth2.Response != nil {
+				resp.StatusCode = errOauth2.Response.StatusCode
+			}
+			return resp
+		}
+		errURL := &url.Error{}
+		if errors.As(err, &errURL) {
+			resp := &Error{
+				RawError: err.Error(),
+			}
+			return resp
+		}
+		return err
+	}
+
+* API サーバーからのレスポンスエラー
+
+続いては, ステータスコードに基づいてのエラーレスポンス処理.
+API レスポンスは, `RawError` に保存する. (`APIError` 型で欲しい場合は, 先述のパースする関数を実行する.)
+
+	response, err := httpClient.Do(req)
+	if err != nil {
+		// handle...
+	}
+	defer response.Body.Close()
+
+	var r io.Reader = response.Body
+	if code := response.StatusCode; code >= http.StatusBadRequest {
+		byt, _ := io.ReadAll(r)
+		res := &Error{
+			StatusCode: code,
+			RawError:   string(byt),
+		}
+		return res
+	}
+
+* テスト編
+
+* テスト編
+
+1. `httptest.Server` をローカルに立ち上げてのテスト
+
+クライアント初期化の際に, APIEndpoint を外部から変更可能にする事によって, テスト時にローカルの `httptest` サーバーエンドポイントと差し替えが可能になる.
+
+2. リクエスト処理を行わない `RoundTripper` を `http.Client` に用いて, 期待値を返す
+
+クライアント初期化の際に, `http.Client` を外部から変更可能にして, `httptest` サーバーを立ち上げずにテスト可能にする.
+
+ref. [[http://hassansin.github.io/Unit-Testing-http-client-in-Go][Unit Testing http client in Go]]
+
+* httptest.Server でのテスト
+
+期待値をレスポンスするハンドラーを実装して, ローカル上にサービングする.
+
+	expected := func(w http.ResponseWriter, r *http.Request) {
+		// ASSERT YOUR REQUEST VALUES
+		// path == "/me"
+		w.Write([]byte(`ok`))
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/me", expected)
+	
+	testserver := httptest.NewServer(mux)
+	defer testserver.Close()
+
+* httptest.Server でのテスト
+
+ローカル上のサーバーエンドポイントをクライアントに渡してテスト.
+
+	conf := NewConfig(testServerURL, ...)
+	client := NewClient(conf)
+	res, err := client.GetMe()
+	if err != nil {
+		t.Error(err)
+	}
+	defer res.Body.Close()
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Error(err)
+	}
+	if body != []byte("ok") {
+		t.Errorf("expected ok, but got: %s", string(body))
+	}
+
+* リクエスト処理を行わない http.Client を用いてのテスト
+
+`DefaultTransport` は使わずに, 期待値をレスポンスする `RoundTripper` をテスト時にセット出来るようにする.
+
+	type RoundTripFunc func(req *http.Request) *http.Response
+	
+	func (f RoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+		return f(req), nil
+	}
+	
+	func NewTestHTTPClient(fn RoundTripFunc) *http.Client {
+		return &http.Client{
+			Transport: fn,
+		}
+	}
+
+* リクエスト処理を行わない http.Client を用いてのテスト
+
+期待値をレスポンスする `RoundTripper` を実装して, `http.Client` にセットしてテスト.
+
+	expected := func(req *http.Request) *http.Response {
+		// ASSERT YOUR REQUEST VALUES
+		// path == "/me"
+		return &http.Response{
+			StatusCode: 200,
+			Body:       ioutil.NopCloser(bytes.NewBufferString(`ok`)),
+			Header:     make(http.Header),
+		}
+	}
+	httpClient := NewTestHTTPClient(expected)
+
+	conf := NewConfig(httpClient, ...)
+	client := NewClient(conf)
+	res, err := client.GetMe()
+	...
