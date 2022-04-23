@@ -19,7 +19,7 @@ Yoshiki Nakagawa
 Gopher
 
 - Go Conference は 2016 年以来
-- 運営チームとコミュニティの方々には, 継続開催への尽力に感謝と尊敬 🙏
+- 運営チームとコミュニティの方々には, 継続開催への尽力に尊敬と感謝 🙏
 
 * Go API クライアントの実装
 
@@ -69,7 +69,7 @@ Gopher
 	conf := NewConfig(endpoint, apiKey)
 	client := NewClient(conf)
 	
-	resp, err := client.GetMe(ctx, tokenSource)
+	resp, err := client.GetMe(ctx)
 
 * 2. OAuth2
 
@@ -129,10 +129,6 @@ Gopher
 * TokenSource
 
 `oauth2.Token` と `err` を返すメソッドを実装するインターフェイス.
-`TokenSource.Token()` 自体は, `http.Client` の Transport 層で呼ばれる.
-
-`RoundTripper` がAPIリクエスト前にトークンが有効かの検証を行う.
-有効期限切れのアクセストークンの場合にはリフレッシュトークンを用いて, `oauth2.Token` の再取得を行う実装になっている.
 
 	type TokenSource interface {
 		// Token returns a token or an error.
@@ -140,6 +136,10 @@ Gopher
 		// The returned Token must not be modified.
 		Token() (*Token, error)
 	}
+
+`TokenSource.Token()` 自体は, `http.Client` の Transport 層で呼ばれる.
+`RoundTripper` がAPIリクエスト前にトークンが有効かの検証を行う.
+有効期限切れのアクセストークンの場合にはリフレッシュトークンを用いて, `oauth2.Token` の再取得を行う実装になっている.
 
 `Token()` メソッドは `Transport.RoundTrip()` で呼ばれるため, concurrency-safe になるよう注意が必要.
 
@@ -151,9 +151,11 @@ c.f. [[https://pkg.go.dev/net/http#RoundTripper][net/http#RoundTripper]]
 
 Transport 層でのリクエスト/レスポンスの制御が行えるようにするためのインターフェイス.
 
-c.f. [[https://pkg.go.dev/net/http#RoundTripper][net/http#RoundTripper]]
+	type RoundTripper interface {
+		RoundTrip(*Request) (*Response, error)
+	}
 
-	RoundTripper is an interface representing the ability to execute a single HTTP transaction, obtaining the Response for a given Request.
+例
 
 - リクエストのリトライの制御
 
@@ -187,9 +189,9 @@ c.f. [[https://pkg.go.dev/net/http#RoundTripper][net/http#RoundTripper]]
 
 * TokenSource
 
-クライアント側にこの実装が入っていれば, アプリ側で token のリフレッシュなどを気にしなくてよくなります。
+Client にこの実装が入っていれば, アプリ側で token のリフレッシュなどを気にしなくてよくなります.
 
-golang.org/x/oauth2 の実装以外で対応する場合, 自力での実装が必要になってきます.
+`golang.org/x/oauth2` の実装以外の仕様がある場合, 自力での実装が必要になってきます.
 
 * OAuth2 の拡張的な仕様が求められた例
 
@@ -218,9 +220,7 @@ golang.org/x/oauth2 の実装以外で対応する場合, 自力での実装が�
 
 * oauth2.ReuseTokenSource
 
-token 初期値と 独自の実装をした `TokenSource` インターフェイスを満たす `tokenRefresher` をセットして初期化するヘルパー関数.
-
-この関数に token (リフレッシュトークン) を渡すとリフレッシュトークンが有効である間は, Oauth ダンスを最初から行う必要なく, Token Endpoint からアクセストークンを取得してくれる.
+token 初期値と独自で実装した `TokenSource` インターフェイスを満たす `tokenRefresher` で初期化するヘルパー関数. `TokenSource` インターフェイスを返す.
 
 	func (c *Client) TokenSource(ctx context.Context, token *oauth2.Token) oauth2.TokenSource {
 		return oauth2.ReuseTokenSource(
@@ -231,6 +231,8 @@ token 初期値と 独自の実装をした `TokenSource` インターフェイ�
 				refreshToken: token.RefreshToken,
 			})
 	}
+
+`tokenRefresher`
 
 	type tokenRefresher struct {
 		ctx          context.Context
@@ -305,12 +307,15 @@ token 初期値と 独自の実装をした `TokenSource` インターフェイ�
 	...
 	token, err = tokenSource.Token()
 
-クライアントはアクセストークンが有効でない場合には, refresh_token から新たなアクセストークン取得を行い, API コールの実行を行ってくれる.
+クライアントはアクセストークンが有効でない場合は,
+refresh_token から新たなアクセストークン取得を行い, API コールを実行する.
+アプリ側で OAuth ダンスを行う必要がない.
+
 APIコール後に更新されたトークンは, `tokenSource.Token()` で取得可能.
 
-* API リクエストの汎用的な実装
+* API リクエストの実装
 
-* API リクエストの汎用的な実装
+* API リクエストの実装
 
 `Client` にユーティリティ関数の `call` メソッドを実装
 
@@ -331,7 +336,7 @@ APIコール後に更新されたトークンは, `tokenSource.Token()` で取�
 アクセストークンが有効期限切れの場合には, Transport 層でリフレッシュトークンでの更新が行われる. アプリ側でも APIコール後に更新されたトークンを保存可能にする.
 3. レスポンスをポインタ型で渡す. (jsonレスポンスをデコードして, 値を入れる)
 
-* API リクエストの汎用的な実装
+* API リクエストの実装
 
 	func (c *Client) call(
 		ctx context.Context, tokenSource oauth2.TokenSource,
@@ -357,7 +362,7 @@ APIコール後に更新されたトークンは, `tokenSource.Token()` で取�
 		return c.do(ctx, tokenSource, req, res)
 	}
 
-* API リクエストの汎用的な実装
+* API リクエストの実装
 
 	func (c *Client) newRequest(
 		ctx context.Context, apiPath string, method string,
@@ -381,7 +386,7 @@ APIコール後に更新されたトークンは, `tokenSource.Token()` で取�
 		return req, nil
 	}
 
-* API リクエストの汎用的な実装
+* API リクエストの実装
 
 	func (c *Client) do(
 		ctx context.Context, tokenSource oauth2.TokenSource,
